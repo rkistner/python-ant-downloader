@@ -39,6 +39,7 @@ def downloader():
     import shutil
     import lxml.etree as etree
     import antd
+    from antd import garmin_fr
     
     # command line
     parser = argparse.ArgumentParser()
@@ -50,6 +51,8 @@ def downloader():
             help="enable all debugging output, NOISY: see config file to selectively enable loggers")
     parser.add_argument("--force", "-f", action="store_const", const=True,
             help="force a connection with device even if it claims no data availible. FOR DEBUG ONLY.")
+    parser.add_argument("--antfs", "-fs", action="store_const", const=True,
+            help="connect to a standard ANT-FS device")
     args = parser.parse_args()
     
     # load configuration
@@ -87,13 +90,20 @@ def downloader():
                     host.link()
                     _log.info("Pairing with device.")
                     client_id = host.auth(pair=not args.daemon)
-                    raw_name = time.strftime("%Y%m%d-%H%M%S.raw")
-                    raw_full_path = antd.cfg.get_path("antd", "raw_output_dir", raw_name, 
-                                                      {"device_id": hex(host.device_id)})
-                    with open(raw_full_path, "w") as file:
-                        _log.info("Saving raw data to %s.", file.name)
-                        # create a garmin device, and initialize its
-                        # ant initialize its capabilities.
+
+                    if args.antfs:
+                        raw_full_path = None
+                        dev = garmin_fr.Device(host)
+
+                        dev.download_all(archived=args.force, path=os.path.expanduser("~/.antd/data"))
+                    else:
+                        raw_name = time.strftime("%Y%m%d-%H%M%S.raw")
+                        raw_full_path = antd.cfg.get_path("antd", "raw_output_dir", raw_name,
+                                {"device_id": hex(host.device_id)})
+                        with open(raw_full_path, "w") as file:
+                            _log.info("Saving raw data to %s.", file.name)
+                            # create a garmin device, and initialize its
+                            # ant initialize its capabilities.
                         dev = antd.Device(host)
                         antd.garmin.dump(file, dev.get_product_data())
                         # download runs
@@ -104,7 +114,8 @@ def downloader():
                     host.disconnect()
                     _log.info("Excuting plugins.")
                     # dispatcher data to plugins
-                    antd.plugin.publish_data(host.device_id, "raw", [raw_full_path])
+                    if raw_full_path:
+                        antd.plugin.publish_data(host.device_id, "raw", [raw_full_path])
                 elif not args.daemon:
                     _log.info("Found device, but no data availible for download.")
                 if not args.daemon: break

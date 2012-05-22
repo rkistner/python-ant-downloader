@@ -38,6 +38,7 @@ import binascii
 import ConfigParser
 
 import antd.ant as ant
+import datetime
 
 _log = logging.getLogger("antd.antfs")
 
@@ -73,6 +74,7 @@ class Command(object):
 
     DATA_PAGE_ID = 0x44
     LINK, DISCONNECT, AUTH, PING, DIRECT = 0x02, 0x03, 0x04, 0x05, 0x0D
+    DOWNLOAD_REQUEST = 0x09
 
     __struct = struct.Struct("<BB6x")
 
@@ -149,6 +151,23 @@ class Auth(Command):
             auth.auth_string = auth.beacon.data[8:8 + auth_string_length]
             return auth
 
+class DownloadRequest(Command):
+
+    COMMAND_ID = Command.DOWNLOAD_REQUEST
+
+    __struct = struct.Struct("<BBHIxBHI")
+
+    def __init__(self, index=0, offset=0, initial_request=True, crc_seed=0, max_block_size=0):
+        self.index = index
+        self.offset = offset
+        self.initial_request = initial_request
+        self.crc_seed = crc_seed
+        self.max_block_size = max_block_size
+
+    def pack(self):
+        return self.__struct.pack(self.DATA_PAGE_ID, self.COMMAND_ID, self.index, self.offset,
+            int(self.initial_request), self.crc_seed, self.max_block_size)
+
 
 class GarminSendDirect(Command):
     
@@ -173,6 +192,79 @@ class GarminSendDirect(Command):
             direct.data = direct.beacon.data[8:8 + 8 * direct.blocks]
             return direct
 
+
+class File(object):
+    def  __init__(self, index, file_type, identifier, type_flags, flags, size, date):
+        self.index = index
+        self.file_type  = file_type
+        self.identifier = identifier
+        self.type_flags = type_flags
+        self.flags = flags
+        self.size = size
+        self.date = date
+
+    @property
+    def archive(self):
+        return bool(self.flags & 0b00010000)
+
+    @property
+    def read(self):
+        return bool(self.flags & 0b10000000)
+
+    @property
+    def write(self):
+        return bool(self.flags & 0b01000000)
+
+    @property
+    def erase(self):
+        return bool(self.flags & 0b00100000)
+
+    @staticmethod
+    def parse(data, index):
+        (file_index, file_type, identifier, type_flags, flags, file_size, file_date_int) =\
+            struct.unpack("<HB3sBBII", data)
+
+        # Sun Dec 31 00:00:00 1989 UTC
+        if file_date_int == 0xFFFFFFFF:
+            file_date = None    # Unknown
+        elif file_date_int < 0x0FFFFFFF:
+            file_date = datetime.datetime.fromtimestamp(index.system_time_base + file_date_int)
+        else:
+            file_date = datetime.datetime.fromtimestamp(file_date_int + 631065600)
+
+        # Hack to parse the identifier
+        identifier = ord(identifier[0]) + (ord(identifier[1]) << 8) + ord(identifier[2]) << 16
+
+        return File(file_index, file_type, identifier, type_flags, flags, file_size, file_date)
+
+    def __str__(self):
+        return "File index=%d type=%d id=%d flags=%s size=%d date=%s archive=%s read=%s write=%s erase=%s" % (self.index, self.file_type, self.identifier,
+            self.flags, self.size, self.date, self.archive, self.read, self.write, self.erase)
+
+    def __repr__(self):
+        return "<%s>" % str(self)
+
+class FileIndex(object):
+    def __init__(self, system_time_base):
+        self.files = []
+        self.system_time_base = system_time_base
+
+    @staticmethod
+    def parse(data):
+        header = data[:16]
+        data = data[16:]
+
+        version, structure_length, time_format, system_time, last_modified = struct.unpack('<BBB5xII', header)
+
+        system_time_base = time.time() - system_time
+        index = FileIndex(system_time_base)
+        while data:
+            file_info = data[:16]
+
+            index.files.append(File.parse(file_info, index))
+            data = data[16:]
+
+        return index
 
 class KnownDeviceDb(object):
 
@@ -251,6 +343,39 @@ class Host(object):
 
     def ping(self):
         self.channel.write(Ping().pack())
+
+    def download(self, index=0):
+        self.channel.write(DownloadRequest(index=index).pack())
+
+        data = self.channel.recv_burst()
+        if len(data) < 24:
+            _log.warning("Not enough data received for download")
+            return None
+
+        beacon = Beacon.unpack(data[:8])
+        header = data[8:24]
+        response, length, offset, file_size = struct.unpack('<xxBxIII', header)
+        if response == 0:
+            body = data[24:-8]
+            footer = data[-8:]
+            # TODO: checksum
+            return body[:length]
+        else:
+            _log.warning("Cannot download file, code %d", response)
+            return None
+
+    def download_index(self):
+        index = self.download(0)
+
+        if index is None:
+            return None
+
+        return FileIndex.parse(index)
+
+
+
+
+
 
     def search(self, search_timeout=60, device_id=None, include_unpaired_devices=False, include_devices_with_no_data=False):
         """
